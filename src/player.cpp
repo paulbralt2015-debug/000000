@@ -329,7 +329,7 @@ bool Player::fetchFrame(std::vector<uint8_t>& px, int& w, int& h, bool& bottomUp
         }
     }
     if (!got && needFirst_) { px.swap(vq_.front().px); vq_.pop_front(); got = true; needFirst_ = false; }
-    if (got) { w = vw_; h = vh_; bottomUp = vstride_ < 0; cv_.notify_all(); }
+    if (got) { w = vw_; h = vh_; bottomUp = false; cv_.notify_all(); }  // images déjà remises dans le bon sens
     return got;
 }
 
@@ -372,14 +372,30 @@ void Player::handleAudio(IMFSample* s, double ts) {
 void Player::handleVideo(IMFSample* s, double ts) {
     ComPtr<IMFMediaBuffer> mb;
     if (FAILED(s->ConvertToContiguousBuffer(&mb))) return;
-    BYTE* p = nullptr; DWORD len = 0;
-    if (FAILED(mb->Lock(&p, nullptr, &len))) return;
-    size_t need = (size_t)vw_ * 4 * vh_;
+    const size_t rowBytes = (size_t)vw_ * 4;
     VFrame f;
     f.ts = ts;
-    f.px.assign(p, p + std::min<size_t>(len, need));
-    f.px.resize(need);
-    mb->Unlock();
+    f.px.assign(rowBytes * vh_, 0);
+    // On lit le pitch réel du tampon (signé) et on recopie toujours en « haut vers bas » :
+    // pitch négatif = image stockée de bas en haut.
+    ComPtr<IMF2DBuffer> b2;
+    if (SUCCEEDED(mb.As(&b2))) {
+        BYTE* sl0 = nullptr; LONG pitch = 0;
+        if (SUCCEEDED(b2->Lock2D(&sl0, &pitch))) {
+            for (int y = 0; y < vh_; y++) std::memcpy(f.px.data() + y * rowBytes, sl0 + (LONGLONG)y * pitch, rowBytes);
+            b2->Unlock2D();
+        }
+    } else {
+        BYTE* p = nullptr; DWORD len = 0;
+        if (FAILED(mb->Lock(&p, nullptr, &len))) return;
+        LONG pitch = vstride_ ? vstride_ : -(LONG)rowBytes;
+        size_t ap = (size_t)(pitch < 0 ? -pitch : pitch);
+        for (int y = 0; y < vh_; y++) {
+            size_t srcRow = pitch < 0 ? (size_t)(vh_ - 1 - y) : (size_t)y;
+            if ((srcRow + 1) * ap <= len) std::memcpy(f.px.data() + y * rowBytes, p + srcRow * ap, rowBytes);
+        }
+        mb->Unlock();
+    }
     std::unique_lock<std::mutex> l(mu_);
     // ne bloque que si l'audio est suffisamment alimenté (évite tout blocage mutuel)
     while (!workerStop_ && seekReq_ < 0 && trackReq_ < 0 && vq_.size() >= 8 && (!hasAudio_ || aqFrames() > (size_t)(aqRate_ / 8)))
